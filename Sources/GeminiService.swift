@@ -31,11 +31,12 @@ struct GeminiResult {
 final class GeminiService {
     private let apiKey: String
     private let baseURL = "https://generativelanguage.googleapis.com/v1beta"
-    private let model = "gemini-3-flash-preview"
+    private let model: String
     private let timeoutSeconds: TimeInterval = 30
 
-    init(apiKey: String) {
+    init(apiKey: String, model: String = "gemini-3-flash-preview") {
         self.apiKey = apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        self.model = model.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "gemini-3-flash-preview" : model.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     // 验证 API Key
@@ -110,9 +111,13 @@ If the audio is empty or silent, return exactly: EMPTY
 """
 
         let payload: [String: Any] = [
+            "systemInstruction": [
+                "parts": [
+                    ["text": systemPrompt]
+                ]
+            ],
             "contents": [[
                 "parts": [
-                    ["text": systemPrompt],
                     ["text": userPrompt],
                     [
                         "inline_data": [

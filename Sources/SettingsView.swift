@@ -1,4 +1,5 @@
 import SwiftUI
+import AppKit
 import AVFoundation
 import ServiceManagement
 
@@ -89,10 +90,12 @@ struct SettingsView: View {
 struct GeneralSettingsView: View {
     @EnvironmentObject var appState: AppState
     @State private var apiKeyInput: String = ""
+    @State private var modelInput: String = ""
+    @State private var systemPromptInput: String = ""
+    @State private var systemPromptSaved = false
     @State private var isValidatingKey = false
     @State private var keyValidationError: String?
     @State private var keyValidationSuccess = false
-    @State private var customVocabularyInput: String = ""
     @State private var micPermissionGranted = false
 
     var body: some View {
@@ -125,8 +128,8 @@ struct GeneralSettingsView: View {
                 SettingsCard("Microphone", icon: "mic.fill") {
                     microphoneSection
                 }
-                SettingsCard("Custom Vocabulary", icon: "text.book.closed.fill") {
-                    vocabularySection
+                SettingsCard("System Prompt", icon: "text.quote") {
+                    systemPromptSection
                 }
                 SettingsCard("Permissions", icon: "lock.shield.fill") {
                     permissionsSection
@@ -136,7 +139,8 @@ struct GeneralSettingsView: View {
         }
         .onAppear {
             apiKeyInput = appState.apiKey
-            customVocabularyInput = appState.customVocabulary
+            modelInput = appState.modelName
+            systemPromptInput = appState.systemPrompt
             checkMicPermission()
         }
     }
@@ -173,6 +177,24 @@ struct GeneralSettingsView: View {
                 Label("API key saved", systemImage: "checkmark.circle.fill")
                     .foregroundStyle(.green)
                     .font(.caption)
+            }
+
+            Divider()
+
+            VStack(alignment: .leading, spacing: 8) {
+                Text("Model")
+                    .font(.headline)
+
+                HStack(spacing: 8) {
+                    TextField("gemini-3-flash-preview", text: $modelInput)
+                        .textFieldStyle(.roundedBorder)
+                        .font(.system(.body, design: .monospaced))
+
+                    Button("Save") {
+                        appState.modelName = modelInput.trimmingCharacters(in: .whitespacesAndNewlines)
+                    }
+                    .disabled(modelInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                }
             }
 
             Divider()
@@ -262,28 +284,38 @@ struct GeneralSettingsView: View {
         }
     }
 
-    // MARK: Custom Vocabulary
-
-    private var vocabularySection: some View {
+    private var systemPromptSection: some View {
         VStack(alignment: .leading, spacing: 10) {
-            Text("Words and phrases to preserve during post-processing.")
+            Text("This prompt is sent as the Gemini system instruction.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
 
-            TextEditor(text: $customVocabularyInput)
+            TextEditor(text: $systemPromptInput)
                 .font(.system(.body, design: .monospaced))
-                .frame(minHeight: 80, maxHeight: 140)
+                .frame(minHeight: 180, maxHeight: 320)
                 .overlay(
                     RoundedRectangle(cornerRadius: 6)
                         .stroke(Color.secondary.opacity(0.3), lineWidth: 1)
                 )
-                .onChange(of: customVocabularyInput) { newValue in
-                    appState.customVocabulary = newValue.trimmingCharacters(in: .whitespacesAndNewlines)
+                .onChange(of: systemPromptInput) { _ in
+                    systemPromptSaved = false
                 }
 
-            Text("Separate entries with commas, new lines, or semicolons.")
-                .font(.caption)
-                .foregroundStyle(.secondary)
+            HStack {
+                Spacer()
+                Button("Save") {
+                    appState.saveSystemPrompt(systemPromptInput)
+                    systemPromptInput = appState.systemPrompt
+                    systemPromptSaved = true
+                }
+                .disabled(systemPromptInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            }
+
+            if systemPromptSaved {
+                Label("System prompt saved", systemImage: "checkmark.circle.fill")
+                    .foregroundStyle(.green)
+                    .font(.caption)
+            }
         }
     }
 
@@ -385,7 +417,7 @@ struct HistoryView: View {
                 VStack(alignment: .leading, spacing: 2) {
                     Text("Recording History")
                         .font(.headline)
-                    Text("Stored locally. Only the \(appState.maxPipelineHistoryCount) most recent runs are kept.")
+                    Text("Stored locally.")
                         .font(.caption)
                         .foregroundStyle(.tertiary)
                 }
@@ -394,10 +426,6 @@ struct HistoryView: View {
                     appState.openRecordingDirectory()
                 }
                 .font(.caption)
-                Button("Clear History") {
-                    appState.clearPipelineHistory()
-                }
-                .disabled(appState.pipelineHistory.isEmpty)
             }
             .padding(.horizontal, 24)
             .padding(.top, 20)
@@ -474,18 +502,20 @@ struct HistoryEntryView: View {
                 .buttonStyle(.plain)
 
                 Button {
-                    withAnimation(.easeInOut(duration: 0.2)) {
-                        appState.deleteHistoryEntry(id: item.id)
+                    let value = item.postProcessedTranscript
+                    if !value.isEmpty {
+                        NSPasteboard.general.clearContents()
+                        NSPasteboard.general.setString(value, forType: .string)
                     }
                 } label: {
-                    Image(systemName: "trash")
+                    Image(systemName: "doc.on.doc")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                         .frame(width: 28, height: 28)
                         .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
-                .help("Delete this run")
+                .help("Copy transcript")
 
                 Button {
                     appState.locateRecordingFile(audioFileName: item.audioFileName)
@@ -521,24 +551,6 @@ struct HistoryEntryView: View {
                         }
                     }
 
-                    // Custom vocabulary
-                    if !item.customVocabulary.isEmpty {
-                        VStack(alignment: .leading, spacing: 6) {
-                            Text("Custom Vocabulary")
-                                .font(.caption.weight(.semibold))
-                            FlowLayout(spacing: 4) {
-                                ForEach(parseVocabulary(item.customVocabulary), id: \.self) { word in
-                                    Text(word)
-                                        .font(.caption2)
-                                        .padding(.horizontal, 8)
-                                        .padding(.vertical, 3)
-                                        .background(Color.accentColor.opacity(0.12))
-                                        .cornerRadius(4)
-                                }
-                            }
-                        }
-                    }
-
                     // Processing step
                     VStack(alignment: .leading, spacing: 10) {
                         Text("Processing")
@@ -554,7 +566,7 @@ struct HistoryEntryView: View {
                                         .foregroundStyle(.secondary)
                                         .textSelection(.enabled)
 
-                                    Text("Processed with Gemini 3 Flash Preview")
+                                    Text("Processed with \(appState.modelName)")
                                         .font(.caption)
                                         .foregroundStyle(.secondary)
 
@@ -612,11 +624,6 @@ struct HistoryEntryView: View {
         )
     }
 
-    private func parseVocabulary(_ text: String) -> [String] {
-        text.components(separatedBy: CharacterSet(charactersIn: ",;\n"))
-            .map { $0.trimmingCharacters(in: .whitespaces) }
-            .filter { !$0.isEmpty }
-    }
 }
 
 // MARK: - Pipeline Step View
@@ -806,4 +813,3 @@ struct FlowLayout: Layout {
         return (CGSize(width: maxWidth, height: totalHeight), positions)
     }
 }
-

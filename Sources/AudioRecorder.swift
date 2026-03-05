@@ -258,45 +258,41 @@ class AudioRecorder: NSObject, ObservableObject {
             throw AudioRecorderError.invalidInputFormat("No stored input format")
         }
 
-        // Create audio file in app's audio directory
-        let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
-        let audioDir = appSupport.appendingPathComponent("SimpleVoiceInput/audio", isDirectory: true)
-
-        // Ensure directory exists
-        if !FileManager.default.fileExists(atPath: audioDir.path) {
-            do {
-                try FileManager.default.createDirectory(at: audioDir, withIntermediateDirectories: true)
-                os_log(.info, log: recordingLog, "Created audio directory at %@", audioDir.path)
-            } catch {
-                os_log(.error, log: recordingLog, "Failed to create audio directory: %@", error.localizedDescription)
-            }
-        }
-
-        let fileURL = audioDir.appendingPathComponent(UUID().uuidString + ".wav")
+        let tempDir = FileManager.default.temporaryDirectory
+        let fileURL = tempDir.appendingPathComponent(UUID().uuidString + ".wav")
         self.tempFileURL = fileURL
 
-        // Remove existing file if present
         if FileManager.default.fileExists(atPath: fileURL.path) {
             try? FileManager.default.removeItem(at: fileURL)
         }
 
-        // Create audio file matching the input format for direct writing
-        // The file will use system's native format (usually 48kHz Float32)
         os_log(.info, log: recordingLog, "Creating audio file at %@", fileURL.path)
         os_log(.info, log: recordingLog, "Input format: sampleRate=%.0f, channels=%d",
                inputFormat.sampleRate, inputFormat.channelCount)
 
+        let newAudioFile: AVAudioFile
         do {
-            let newAudioFile = try AVAudioFile(
-                forWriting: fileURL,
-                settings: inputFormat.settings
-            )
-            os_log(.info, log: recordingLog, "audio file created successfully: %.3fms", (CFAbsoluteTimeGetCurrent() - t0) * 1000)
-            audioFileQueue.sync { self.audioFile = newAudioFile }
+            newAudioFile = try AVAudioFile(forWriting: fileURL, settings: inputFormat.settings)
         } catch {
-            os_log(.error, log: recordingLog, "Failed to create audio file: %@", error.localizedDescription)
-            throw AudioRecorderError.invalidInputFormat("Failed to create audio file: \(error.localizedDescription)")
+            let fallbackSettings: [String: Any] = [
+                AVFormatIDKey: kAudioFormatLinearPCM,
+                AVSampleRateKey: inputFormat.sampleRate,
+                AVNumberOfChannelsKey: inputFormat.channelCount,
+                AVLinearPCMBitDepthKey: 16,
+                AVLinearPCMIsFloatKey: false,
+                AVLinearPCMIsBigEndianKey: false,
+                AVLinearPCMIsNonInterleaved: inputFormat.isInterleaved ? 0 : 1
+            ]
+            newAudioFile = try AVAudioFile(
+                forWriting: fileURL,
+                settings: fallbackSettings,
+                commonFormat: .pcmFormatInt16,
+                interleaved: inputFormat.isInterleaved
+            )
         }
+
+        os_log(.info, log: recordingLog, "audio file created successfully: %.3fms", (CFAbsoluteTimeGetCurrent() - t0) * 1000)
+        audioFileQueue.sync { self.audioFile = newAudioFile }
 
         _recording.withLock { $0 = true }
         self.isRecording = true

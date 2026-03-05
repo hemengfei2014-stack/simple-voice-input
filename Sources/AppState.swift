@@ -31,12 +31,14 @@ enum SettingsTab: String, CaseIterable, Identifiable {
 
 final class AppState: ObservableObject, @unchecked Sendable {
     private let apiKeyStorageKey = "gemini_api_key"
+    private let modelNameStorageKey = "gemini_model_name"
     private let customVocabularyStorageKey = "custom_vocabulary"
     private let selectedMicrophoneStorageKey = "selected_microphone_id"
     private let systemPromptStorageKey = "system_prompt"
     private let systemPromptLastModifiedStorageKey = "system_prompt_last_modified"
+    private let systemPromptBackupsStorageKey = "system_prompt_backups"
     private let transcribingIndicatorDelay: TimeInterval = 1.0
-    let maxPipelineHistoryCount = 20
+    let maxPipelineHistoryCount = Int.max
 
     @Published var hasCompletedSetup: Bool {
         didSet {
@@ -47,6 +49,12 @@ final class AppState: ObservableObject, @unchecked Sendable {
     @Published var apiKey: String {
         didSet {
             persistAPIKey(apiKey)
+        }
+    }
+
+    @Published var modelName: String {
+        didSet {
+            UserDefaults.standard.set(modelName, forKey: modelNameStorageKey)
         }
     }
 
@@ -100,29 +108,28 @@ final class AppState: ObservableObject, @unchecked Sendable {
     private var transcribingIndicatorTask: Task<Void, Never>?
     private var audioDeviceListenerBlock: AudioObjectPropertyListenerBlock?
     private let pipelineHistoryStore = PipelineHistoryStore()
+    private var injectionTargetPID: pid_t?
+
+    private struct SystemPromptBackup: Codable {
+        let timestamp: Date
+        let prompt: String
+    }
 
     init() {
         let hasCompletedSetup = UserDefaults.standard.bool(forKey: "hasCompletedSetup")
         let apiKey = Self.loadStoredAPIKey(account: apiKeyStorageKey)
+        let modelName = UserDefaults.standard.string(forKey: modelNameStorageKey) ?? "gemini-3-flash-preview"
         let customVocabulary = UserDefaults.standard.string(forKey: customVocabularyStorageKey) ?? ""
         let systemPrompt = UserDefaults.standard.string(forKey: systemPromptStorageKey) ?? Self.loadDefaultSystemPrompt()
         let systemPromptLastModified = UserDefaults.standard.string(forKey: systemPromptLastModifiedStorageKey) ?? ""
         let initialAccessibility = AXIsProcessTrusted()
-        var removedAudioFileNames: [String] = []
-        do {
-            removedAudioFileNames = try pipelineHistoryStore.trim(to: maxPipelineHistoryCount)
-        } catch {
-            print("Failed to trim pipeline history during init: \(error)")
-        }
-        for audioFileName in removedAudioFileNames {
-            Self.deleteAudioFile(audioFileName)
-        }
         let savedHistory = pipelineHistoryStore.loadAllHistory()
 
         let selectedMicrophoneID = UserDefaults.standard.string(forKey: selectedMicrophoneStorageKey) ?? "default"
 
         self.hasCompletedSetup = hasCompletedSetup
         self.apiKey = apiKey
+        self.modelName = modelName
         self.customVocabulary = customVocabulary
         self.systemPrompt = systemPrompt
         self.systemPromptLastModified = systemPromptLastModified
@@ -135,8 +142,52 @@ final class AppState: ObservableObject, @unchecked Sendable {
         installAudioDeviceListener()
     }
 
+    func saveSystemPrompt(_ newPrompt: String) {
+        let trimmed = newPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+
+        let existing = systemPrompt
+        if trimmed != existing, !existing.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            var backups: [SystemPromptBackup] = []
+            if let data = UserDefaults.standard.data(forKey: systemPromptBackupsStorageKey),
+               let decoded = try? JSONDecoder().decode([SystemPromptBackup].self, from: data) {
+                backups = decoded
+            }
+            backups.append(SystemPromptBackup(timestamp: Date(), prompt: existing))
+            if backups.count > 50 {
+                backups.removeFirst(backups.count - 50)
+            }
+            if let encoded = try? JSONEncoder().encode(backups) {
+                UserDefaults.standard.set(encoded, forKey: systemPromptBackupsStorageKey)
+            }
+        }
+
+        systemPrompt = trimmed
+        systemPromptLastModified = ISO8601DateFormatter().string(from: Date())
+    }
+
     deinit {
         removeAudioDeviceListener()
+    }
+
+    private func installAudioDeviceListener() {
+        var propertyAddress = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyDevices,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        let block: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
+            DispatchQueue.main.async {
+                self?.refreshAvailableMicrophones()
+            }
+        }
+        audioDeviceListenerBlock = block
+        AudioObjectAddPropertyListenerBlock(
+            AudioObjectID(kAudioObjectSystemObject),
+            &propertyAddress,
+            DispatchQueue.main,
+            block
+        )
     }
 
     private func removeAudioDeviceListener() {
@@ -200,7 +251,7 @@ final class AppState: ObservableObject, @unchecked Sendable {
         }
     }
 
-    private static func deleteAudioFile(_ fileName: String) {
+    static func deleteAudioFile(_ fileName: String) {
         let fileURL = audioStorageDirectory().appendingPathComponent(fileName)
         try? FileManager.default.removeItem(at: fileURL)
     }
@@ -229,12 +280,21 @@ final class AppState: ObservableObject, @unchecked Sendable {
         }
     }
 
+    func openAccessibilitySettings() {
+        let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")!
+        NSWorkspace.shared.open(url)
+    }
+
     func startAccessibilityPolling() {
         accessibilityTimer?.invalidate()
-        hasAccessibility = AXIsProcessTrusted()
-        accessibilityTimer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
-            DispatchQueue.main.async {
-                self?.hasAccessibility = AXIsProcessTrusted()
+        accessibilityTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
+            guard let self = self else { return }
+            let trusted = AXIsProcessTrusted()
+            if trusted != self.hasAccessibility {
+                self.hasAccessibility = trusted
+                if trusted {
+                    self.stopAccessibilityPolling()
+                }
             }
         }
     }
@@ -242,11 +302,6 @@ final class AppState: ObservableObject, @unchecked Sendable {
     func stopAccessibilityPolling() {
         accessibilityTimer?.invalidate()
         accessibilityTimer = nil
-    }
-
-    func openAccessibilitySettings() {
-        let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue(): true] as CFDictionary
-        AXIsProcessTrustedWithOptions(options)
     }
 
     private func setLaunchAtLogin(_ enabled: Bool) {
@@ -257,11 +312,7 @@ final class AppState: ObservableObject, @unchecked Sendable {
                 try SMAppService.mainApp.unregister()
             }
         } catch {
-            // Revert the toggle on failure without re-triggering didSet
-            let current = SMAppService.mainApp.status == .enabled
-            if current != launchAtLogin {
-                launchAtLogin = current
-            }
+            print("Failed to set launch at login: \(error)")
         }
     }
 
@@ -274,26 +325,6 @@ final class AppState: ObservableObject, @unchecked Sendable {
 
     func refreshAvailableMicrophones() {
         availableMicrophones = AudioDevice.availableInputDevices()
-    }
-
-    private func installAudioDeviceListener() {
-        var propertyAddress = AudioObjectPropertyAddress(
-            mSelector: kAudioHardwarePropertyDevices,
-            mScope: kAudioObjectPropertyScopeGlobal,
-            mElement: kAudioObjectPropertyElementMain
-        )
-        let block: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
-            DispatchQueue.main.async {
-                self?.refreshAvailableMicrophones()
-            }
-        }
-        audioDeviceListenerBlock = block
-        AudioObjectAddPropertyListenerBlock(
-            AudioObjectID(kAudioObjectSystemObject),
-            &propertyAddress,
-            DispatchQueue.main,
-            block
-        )
     }
 
     func startHotkeyMonitoring() {
@@ -322,7 +353,9 @@ final class AppState: ObservableObject, @unchecked Sendable {
     private func startRecording() {
         let t0 = CFAbsoluteTimeGetCurrent()
         os_log(.info, log: recordingLog, "startRecording() entered")
+        captureInjectionTargetIfNeeded()
         guard hasAccessibility else {
+            injectionTargetPID = nil
             errorMessage = "Accessibility permission required. Grant access in System Settings > Privacy & Security > Accessibility."
             statusText = "No Accessibility"
             showAccessibilityAlert()
@@ -346,6 +379,7 @@ final class AppState: ObservableObject, @unchecked Sendable {
                     if granted {
                         self?.beginRecording()
                     } else {
+                        self?.injectionTargetPID = nil
                         self?.errorMessage = "Microphone permission denied. Grant access in System Settings > Privacy & Security > Microphone."
                         self?.statusText = "No Microphone"
                         self?.showMicrophonePermissionAlert()
@@ -354,6 +388,7 @@ final class AppState: ObservableObject, @unchecked Sendable {
             }
             return false
         default:
+            injectionTargetPID = nil
             errorMessage = "Microphone permission denied. Grant access in System Settings > Privacy & Security > Microphone."
             statusText = "No Microphone"
             showMicrophonePermissionAlert()
@@ -418,27 +453,16 @@ final class AppState: ObservableObject, @unchecked Sendable {
                     self.isRecording = false
                     self.errorMessage = self.formattedRecordingStartError(error)
                     self.statusText = "Error"
-                    self.overlayManager.dismiss()
                 }
             }
         }
     }
 
     private func formattedRecordingStartError(_ error: Error) -> String {
-        if let recorderError = error as? AudioRecorderError {
-            return "Failed to start recording: \(recorderError.localizedDescription)"
-        }
-
-        let lower = error.localizedDescription.lowercased()
-        if lower.contains("operation couldn't be completed") || lower.contains("operation could not be completed") {
-            return "Failed to start recording: Audio input error. Verify microphone access is granted and a working mic is selected in System Settings > Sound > Input."
-        }
-
         let nsError = error as NSError
         if nsError.domain == NSOSStatusErrorDomain {
             return "Failed to start recording (audio subsystem error \(nsError.code)). Check microphone permissions and selected input device."
         }
-
         return "Failed to start recording: \(error.localizedDescription)"
     }
 
@@ -484,6 +508,7 @@ final class AppState: ObservableObject, @unchecked Sendable {
 
         guard let fileURL = audioRecorder.stopRecording() else {
             audioRecorder.cleanup()
+            injectionTargetPID = nil
             errorMessage = "No audio recorded"
             isRecording = false
             statusText = "Error"
@@ -511,7 +536,7 @@ final class AppState: ObservableObject, @unchecked Sendable {
             } catch {}
         }
 
-        let geminiService = GeminiService(apiKey: apiKey)
+        let geminiService = GeminiService(apiKey: apiKey, model: modelName)
 
         Task {
             do {
@@ -551,9 +576,7 @@ final class AppState: ObservableObject, @unchecked Sendable {
                         NSPasteboard.general.clearContents()
                         NSPasteboard.general.setString(trimmedTranscript, forType: .string)
 
-                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
-                            self.pasteAtCursor()
-                        }
+                        self.injectTranscriptAtCursor()
                     }
 
                     self.audioRecorder.cleanup()
@@ -569,6 +592,7 @@ final class AppState: ObservableObject, @unchecked Sendable {
                     self.transcribingIndicatorTask?.cancel()
                     self.transcribingIndicatorTask = nil
                     self.errorMessage = error.localizedDescription
+                    self.injectionTargetPID = nil
                     self.isTranscribing = false
                     self.statusText = "Error"
                     self.audioRecorder.cleanup()
@@ -666,15 +690,68 @@ final class AppState: ObservableObject, @unchecked Sendable {
         NSWorkspace.shared.activateFileViewerSelecting([fileURL])
     }
 
+    private func captureInjectionTargetIfNeeded() {
+        let frontmost = NSWorkspace.shared.frontmostApplication
+        guard let frontmost, frontmost.processIdentifier != NSRunningApplication.current.processIdentifier else { return }
+        injectionTargetPID = frontmost.processIdentifier
+    }
+
+    private func captureInjectionTarget() {
+        let frontmost = NSWorkspace.shared.frontmostApplication
+        guard let frontmost, frontmost.processIdentifier != NSRunningApplication.current.processIdentifier else { return }
+        injectionTargetPID = frontmost.processIdentifier
+    }
+
+    private func injectTranscriptAtCursor() {
+        guard !lastTranscript.isEmpty else {
+            injectionTargetPID = nil
+            return
+        }
+
+        // If target PID is lost, try to capture current frontmost (might be us if overlay took focus, but better than nothing)
+        if injectionTargetPID == nil {
+            captureInjectionTarget()
+        }
+
+        var appToActivate: NSRunningApplication?
+        if let pid = injectionTargetPID {
+            appToActivate = NSWorkspace.shared.runningApplications.first(where: { $0.processIdentifier == pid })
+        }
+
+        if let app = appToActivate {
+            // Force activate the target application
+            let success = app.activate(options: [.activateIgnoringOtherApps, .activateAllWindows])
+            if !success {
+                os_log(.error, log: recordingLog, "Failed to activate target app PID %{public}d", app.processIdentifier)
+            }
+        }
+
+        // Wait for app activation to complete before pasting
+        // 0.6s should be enough for most context switches
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { [weak self] in
+            self?.pasteAtCursor()
+            self?.injectionTargetPID = nil
+        }
+    }
+
     private func pasteAtCursor() {
-        let source = CGEventSource(stateID: .hidSystemState)
+        // Use .hidSystemState for more reliable event posting
+        guard let source = CGEventSource(stateID: .hidSystemState) else {
+            os_log(.error, log: recordingLog, "Failed to create CGEventSource")
+            return
+        }
 
-        let keyDown = CGEvent(keyboardEventSource: source, virtualKey: 9, keyDown: true)
-        keyDown?.flags = .maskCommand
-        keyDown?.post(tap: .cgSessionEventTap)
+        // Command + V
+        let cmdFlag = CGEventFlags.maskCommand
+        
+        let keyDown = CGEvent(keyboardEventSource: source, virtualKey: 0x09, keyDown: true) // 0x09 is 'v'
+        keyDown?.flags = cmdFlag
+        keyDown?.post(tap: .cghidEventTap)
 
-        let keyUp = CGEvent(keyboardEventSource: source, virtualKey: 9, keyDown: false)
-        keyUp?.flags = .maskCommand
-        keyUp?.post(tap: .cgSessionEventTap)
+        let keyUp = CGEvent(keyboardEventSource: source, virtualKey: 0x09, keyDown: false)
+        keyUp?.flags = cmdFlag
+        keyUp?.post(tap: .cghidEventTap)
+        
+        os_log(.info, log: recordingLog, "Posted Cmd+V events")
     }
 }

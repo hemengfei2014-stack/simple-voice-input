@@ -54,14 +54,6 @@ struct MenuBarView: View {
                     .padding(.vertical, 6)
             }
 
-            Divider()
-
-            // Manual toggle
-            Button(appState.isRecording ? "Stop Recording" : "Start Dictating") {
-                appState.toggleRecording()
-            }
-            .disabled(appState.isTranscribing)
-
             if let error = appState.errorMessage {
                 Divider()
                 Text(error)
@@ -69,21 +61,6 @@ struct MenuBarView: View {
                     .font(.caption)
                     .padding(.horizontal, 16)
                     .lineLimit(3)
-            }
-
-            if !appState.lastTranscript.isEmpty && !appState.isRecording && !appState.isTranscribing {
-                Divider()
-                Text(appState.lastTranscript)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .padding(.horizontal, 16)
-                    .lineLimit(4)
-                    .frame(maxWidth: 280, alignment: .leading)
-
-                Button("Copy Again") {
-                    NSPasteboard.general.clearContents()
-                    NSPasteboard.general.setString(appState.lastTranscript, forType: .string)
-                }
             }
 
             Divider()
@@ -112,18 +89,8 @@ struct MenuBarView: View {
                 }
             }
 
-            Button("Re-run Setup...") {
-                NotificationCenter.default.post(name: .showSetup, object: nil)
-            }
-
             Button("Settings") {
                 NotificationCenter.default.post(name: .showSettings, object: nil)
-            }
-
-            Divider()
-
-            Button(appState.isDebugOverlayActive ? "Stop Debug Overlay" : "Debug Overlay") {
-                appState.toggleDebugOverlay()
             }
 
             Divider()

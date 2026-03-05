@@ -1,4 +1,5 @@
 import SwiftUI
+import AppKit
 import AVFoundation
 import Combine
 import Foundation
@@ -21,6 +22,7 @@ struct SetupView: View {
     @State private var micPermissionGranted = false
     @State private var accessibilityGranted = false
     @State private var apiKeyInput: String = ""
+    @State private var modelInput: String = ""
     @State private var isValidatingKey = false
     @State private var keyValidationError: String?
     @State private var accessibilityTimer: Timer?
@@ -121,6 +123,7 @@ struct SetupView: View {
         .frame(width: 520, height: 520)
         .onAppear {
             apiKeyInput = appState.apiKey
+            modelInput = appState.modelName
             checkMicPermission()
             checkAccessibility()
         }
@@ -201,6 +204,15 @@ struct SetupView: View {
                             .foregroundStyle(.red)
                             .font(.caption)
                     }
+                }
+
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("Model")
+                        .font(.headline)
+                    TextField("gemini-3-flash-preview", text: $modelInput)
+                        .textFieldStyle(.roundedBorder)
+                        .font(.system(.body, design: .monospaced))
+                        .disabled(isValidatingKey)
                 }
             }
 
@@ -514,6 +526,7 @@ struct SetupView: View {
 
     func validateAndContinue() {
         let key = apiKeyInput.trimmingCharacters(in: .whitespacesAndNewlines)
+        let model = modelInput.trimmingCharacters(in: .whitespacesAndNewlines)
         isValidatingKey = true
         keyValidationError = nil
 
@@ -523,6 +536,9 @@ struct SetupView: View {
                 isValidatingKey = false
                 if valid {
                     appState.apiKey = key
+                    if !model.isEmpty {
+                        appState.modelName = model
+                    }
                     withAnimation {
                         currentStep = nextStep(currentStep)
                     }
@@ -585,6 +601,10 @@ struct SetupView: View {
     func requestAccessibility() {
         let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue(): true] as CFDictionary
         AXIsProcessTrustedWithOptions(options)
+        let settingsURL = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")
+        if let url = settingsURL {
+            NSWorkspace.shared.open(url)
+        }
     }
 
     // MARK: - Test Transcription
@@ -615,7 +635,7 @@ struct SetupView: View {
 
                     Task {
                         do {
-                            let service = GeminiService(apiKey: appState.apiKey)
+                            let service = GeminiService(apiKey: appState.apiKey, model: appState.modelName)
                             let result = try await service.processAudio(
                                 fileURL: url,
                                 systemPrompt: appState.systemPrompt

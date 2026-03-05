@@ -23,10 +23,10 @@
     <key>LSUIElement</key>
     <true/>
     <key>NSMicrophoneUsageDescription</key>
-    <string>FreeFlow needs microphone access to transcribe your speech.</string>
+    <string>SimpleVoiceInput needs microphone access to record audio for transcription.</string>
     <key>NSSpeechRecognitionUsageDescription</key>
-    <string>FreeFlow needs speech recognition to convert your voice to text.</string>
+    <string>SimpleVoiceInput needs speech recognition to convert your voice to text.</string>
     <key>NSAccessibilityUsageDescription</key>
-    <string>FreeFlow needs accessibility access to detect the text cursor position and paste transcribed text.</string>
+    <string>SimpleVoiceInput needs accessibility access to paste transcribed text into your apps.</string>
 </dict>
 </plist>

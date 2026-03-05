@@ -45,7 +45,7 @@ private func makeNotchContent<V: View>(
     let shaped = rootView
         .frame(width: width, height: height)
         .background(Color.black)
-        .clipShape(UnevenRoundedRectangle(bottomLeadingRadius: cornerRadius, bottomTrailingRadius: cornerRadius))
+        .clipShape(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
 
     let hosting = NSHostingView(rootView: shaped)
     hosting.frame = NSRect(x: 0, y: 0, width: width, height: height)
@@ -114,29 +114,23 @@ class RecordingOverlayManager {
         DispatchQueue.main.async { self._dismiss() }
     }
 
-    /// Height of the notch area (menu bar inset) that the panel extends into.
-    private var notchOverlap: CGFloat {
-        guard let screen = NSScreen.main else { return 0 }
-        return screen.frame.maxY - screen.visibleFrame.maxY
+    private func overlayY(for screen: NSScreen, height: CGFloat) -> CGFloat {
+        screen.visibleFrame.minY + 56
+    }
+
+    private func overlayHiddenY(for screen: NSScreen, height: CGFloat) -> CGFloat {
+        screen.visibleFrame.minY - height - 20
     }
 
     private func _showOverlayPanel() {
-        let hasNotch = screenHasNotch
-        let panelWidth: CGFloat = hasNotch ? max(notchWidth, 120) : 120
+        let panelWidth: CGFloat = 120
         let contentHeight: CGFloat = 32
-        // On notch screens, extend the panel up into the menu bar to connect with the notch
-        let overlap = hasNotch ? notchOverlap : 0
-        let panelHeight = contentHeight + overlap
+        let panelHeight = contentHeight
 
         if let panel = overlayWindow {
             guard let screen = NSScreen.main else { return }
             let x = panelX(screen, width: panelWidth)
-            let y: CGFloat
-            if hasNotch {
-                y = screen.frame.maxY - panelHeight
-            } else {
-                y = screen.frame.maxY - panelHeight
-            }
+            let y = overlayY(for: screen, height: panelHeight)
             panel.setFrame(NSRect(x: x, y: y, width: panelWidth, height: panelHeight), display: true)
             panel.alphaValue = 1
             panel.orderFrontRegardless()
@@ -150,14 +144,14 @@ class RecordingOverlayManager {
         panel.contentView = makeNotchContent(
             width: panelWidth,
             height: panelHeight,
-            cornerRadius: hasNotch ? 18 : 12,
-            rootView: view.padding(.top, overlap)
+            cornerRadius: 16,
+            rootView: view
         )
 
         if let screen = NSScreen.main {
             let x = panelX(screen, width: panelWidth)
-            let hiddenY = screen.frame.maxY
-            let visibleY = screen.frame.maxY - panelHeight
+            let hiddenY = overlayHiddenY(for: screen, height: panelHeight)
+            let visibleY = overlayY(for: screen, height: panelHeight)
 
             panel.setFrame(NSRect(x: x, y: hiddenY, width: panelWidth, height: panelHeight), display: true)
             panel.alphaValue = 1
@@ -180,7 +174,7 @@ class RecordingOverlayManager {
             return
         }
 
-        let hiddenY = screen.frame.maxY
+        let hiddenY = overlayHiddenY(for: screen, height: panel.frame.height)
         let frame = panel.frame
 
         NSAnimationContext.runAnimationGroup({ context in
@@ -204,11 +198,9 @@ class RecordingOverlayManager {
 
         if transcribingPanel != nil { return }
 
-        let hasNotch = screenHasNotch
         let contentHeight: CGFloat = 22
-        let overlap = hasNotch ? notchOverlap : 0
         let panelWidth: CGFloat = 44
-        let panelHeight = contentHeight + overlap
+        let panelHeight = contentHeight
 
         let panel = makeOverlayPanel(width: panelWidth, height: panelHeight)
         panel.hasShadow = false
@@ -217,13 +209,13 @@ class RecordingOverlayManager {
         panel.contentView = makeNotchContent(
             width: panelWidth,
             height: panelHeight,
-            cornerRadius: hasNotch ? 14 : 11,
-            rootView: view.padding(.top, overlap)
+            cornerRadius: 14,
+            rootView: view
         )
 
         if let screen = NSScreen.main {
             let x = panelX(screen, width: panelWidth)
-            let y = screen.frame.maxY - panelHeight
+            let y = overlayY(for: screen, height: panelHeight)
             panel.setFrame(NSRect(x: x, y: y, width: panelWidth, height: panelHeight), display: true)
         }
 
