@@ -158,10 +158,6 @@ struct SetupView: View {
 
     var apiKeyStep: some View {
         VStack(spacing: 20) {
-            Image(systemName: "key.fill")
-                .font(.system(size: 60))
-                .foregroundStyle(.blue)
-
             Text("Gemini API Key")
                 .font(.title)
                 .fontWeight(.bold)
