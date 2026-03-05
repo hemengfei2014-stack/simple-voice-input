@@ -1,0 +1,17 @@
+.DS_Store
+
+DerivedData/
+xcuserdata/
+*.xcuserstate
+*.xccheckout
+*.xcscmblueprint
+
+.build/
+.swiftpm/
+Package.resolved
+
+/build/
+*.dSYM/
+
+*.log
+.env

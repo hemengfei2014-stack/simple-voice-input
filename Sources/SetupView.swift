@@ -1,0 +1,823 @@
+import SwiftUI
+import AVFoundation
+import Combine
+import Foundation
+import ServiceManagement
+
+struct SetupView: View {
+    var onComplete: () -> Void
+    @EnvironmentObject var appState: AppState
+    @Environment(\.openURL) private var openURL
+    private enum SetupStep: Int, CaseIterable {
+        case welcome = 0
+        case apiKey
+        case micPermission
+        case accessibility
+        case testTranscription
+        case ready
+    }
+
+    @State private var currentStep = SetupStep.welcome
+    @State private var micPermissionGranted = false
+    @State private var accessibilityGranted = false
+    @State private var apiKeyInput: String = ""
+    @State private var isValidatingKey = false
+    @State private var keyValidationError: String?
+    @State private var accessibilityTimer: Timer?
+    @State private var micPermissionTimer: Timer?
+
+    // Test transcription state
+    private enum TestPhase: Equatable {
+        case idle, recording, transcribing, done
+    }
+    @State private var testPhase: TestPhase = .idle
+    @State private var testAudioRecorder: AudioRecorder? = nil
+    @State private var testAudioLevel: Float = 0.0
+    @State private var testTranscript: String = ""
+    @State private var testError: String? = nil
+    @State private var testAudioLevelCancellable: AnyCancellable? = nil
+    @State private var testMicPulsing = false
+
+    private let totalSteps: [SetupStep] = SetupStep.allCases
+
+    var body: some View {
+        VStack(spacing: 0) {
+            Group {
+                switch currentStep {
+                case .welcome:
+                    welcomeStep
+                case .apiKey:
+                    apiKeyStep
+                case .micPermission:
+                    micPermissionStep
+                case .accessibility:
+                    accessibilityStep
+                case .testTranscription:
+                    testTranscriptionStep
+                case .ready:
+                    readyStep
+                }
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .padding(40)
+
+            Divider()
+
+            HStack {
+                if currentStep != .welcome {
+                    Button("Back") {
+                        keyValidationError = nil
+                        withAnimation {
+                            currentStep = previousStep(currentStep)
+                        }
+                    }
+                    .disabled(isValidatingKey)
+                }
+                Spacer()
+                if currentStep != .ready {
+                    if currentStep == .apiKey {
+                        // API key step: validate before continuing
+                        Button(isValidatingKey ? "Validating..." : "Continue") {
+                            validateAndContinue()
+                        }
+                        .keyboardShortcut(.defaultAction)
+                        .disabled(apiKeyInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || isValidatingKey)
+                    } else if currentStep == .testTranscription {
+                        Button("Skip") {
+                            stopTestHotkeyMonitoring()
+                            withAnimation {
+                                currentStep = nextStep(currentStep)
+                            }
+                        }
+                        .buttonStyle(.plain)
+                        .foregroundStyle(.secondary)
+
+                        Button("Continue") {
+                            stopTestHotkeyMonitoring()
+                            withAnimation {
+                                currentStep = nextStep(currentStep)
+                            }
+                        }
+                        .keyboardShortcut(.defaultAction)
+                        .disabled(testPhase != .done || testTranscript.isEmpty || testError != nil)
+                    } else {
+                        Button("Continue") {
+                            withAnimation {
+                                currentStep = nextStep(currentStep)
+                            }
+                        }
+                        .keyboardShortcut(.defaultAction)
+                        .disabled(!canContinueFromCurrentStep)
+                    }
+                } else {
+                    Button("Get Started") {
+                        onComplete()
+                    }
+                    .keyboardShortcut(.defaultAction)
+                }
+            }
+            .padding(20)
+        }
+        .frame(width: 520, height: 520)
+        .onAppear {
+            apiKeyInput = appState.apiKey
+            checkMicPermission()
+            checkAccessibility()
+        }
+        .onDisappear {
+            accessibilityTimer?.invalidate()
+            micPermissionTimer?.invalidate()
+        }
+    }
+
+    // MARK: - Steps
+
+    var welcomeStep: some View {
+        VStack(spacing: 16) {
+            Image(nsImage: NSApp.applicationIconImage)
+                .resizable()
+                .aspectRatio(contentMode: .fit)
+                .frame(width: 128, height: 128)
+
+            VStack(spacing: 6) {
+                Text("Welcome to SimpleVoiceInput")
+                    .font(.system(size: 30, weight: .bold, design: .rounded))
+
+                Text("Dictate text anywhere on your Mac.\nPress Fn key to record, press again to transcribe.")
+                    .multilineTextAlignment(.center)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            stepIndicator
+        }
+    }
+
+    var apiKeyStep: some View {
+        VStack(spacing: 20) {
+            Image(systemName: "key.fill")
+                .font(.system(size: 60))
+                .foregroundStyle(.blue)
+
+            Text("Gemini API Key")
+                .font(.title)
+                .fontWeight(.bold)
+
+            Text("SimpleVoiceInput uses Google Gemini 3 Flash Preview for audio transcription and text processing.")
+                .multilineTextAlignment(.center)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+
+            VStack(alignment: .leading, spacing: 10) {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("How to get a free API key:")
+                        .font(.subheadline.weight(.semibold))
+                    VStack(alignment: .leading, spacing: 2) {
+                        instructionRow(number: "1", text: "Go to [ai.google.dev](https://ai.google.dev)")
+                        instructionRow(number: "2", text: "Create a free account (if you don't have one)")
+                        instructionRow(number: "3", text: "Click **Get API Key** and copy it")
+                    }
+                }
+                .padding(10)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(
+                    RoundedRectangle(cornerRadius: 8)
+                        .fill(Color.blue.opacity(0.06))
+                )
+
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("API Key")
+                        .font(.headline)
+                    SecureField("Paste your Gemini API key", text: $apiKeyInput)
+                        .textFieldStyle(.roundedBorder)
+                        .font(.system(.body, design: .monospaced))
+                        .disabled(isValidatingKey)
+                        .onChange(of: apiKeyInput) { _ in
+                            keyValidationError = nil
+                        }
+
+                    if let error = keyValidationError {
+                        Label(error, systemImage: "xmark.circle.fill")
+                            .foregroundStyle(.red)
+                            .font(.caption)
+                    }
+                }
+            }
+
+            stepIndicator
+        }
+    }
+
+    var micPermissionStep: some View {
+        VStack(spacing: 20) {
+            Image(systemName: "mic.fill")
+                .font(.system(size: 60))
+                .foregroundStyle(.blue)
+
+            Text("Microphone Access")
+                .font(.title)
+                .fontWeight(.bold)
+
+            Text("SimpleVoiceInput needs access to your microphone to record audio for transcription.")
+                .multilineTextAlignment(.center)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+
+            HStack {
+                Image(systemName: "mic.fill")
+                    .frame(width: 24)
+                    .foregroundStyle(.blue)
+                Text("Microphone")
+                Spacer()
+                if micPermissionGranted {
+                    Image(systemName: "checkmark.circle.fill")
+                        .foregroundStyle(.green)
+                    Text("Granted")
+                        .foregroundStyle(.green)
+                } else {
+                    Button("Grant Access") {
+                        requestMicPermission()
+                    }
+                }
+            }
+            .padding(12)
+            .background(Color(nsColor: .controlBackgroundColor))
+            .cornerRadius(8)
+
+            stepIndicator
+        }
+        .onAppear {
+            startMicPermissionPolling()
+        }
+        .onDisappear {
+            micPermissionTimer?.invalidate()
+        }
+    }
+
+    var accessibilityStep: some View {
+        VStack(spacing: 20) {
+            Image(systemName: "hand.raised.fill")
+                .font(.system(size: 60))
+                .foregroundStyle(.blue)
+
+            Text("Accessibility Access")
+                .font(.title)
+                .fontWeight(.bold)
+
+            Text("SimpleVoiceInput needs Accessibility access to paste transcribed text into your apps.")
+                .multilineTextAlignment(.center)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+
+            HStack {
+                Image(systemName: "hand.raised.fill")
+                    .frame(width: 24)
+                    .foregroundStyle(.blue)
+                Text("Accessibility")
+                Spacer()
+                if accessibilityGranted {
+                    Image(systemName: "checkmark.circle.fill")
+                        .foregroundStyle(.green)
+                    Text("Granted")
+                        .foregroundStyle(.green)
+                } else {
+                    Button("Open Settings") {
+                        requestAccessibility()
+                    }
+                }
+            }
+            .padding(12)
+            .background(Color(nsColor: .controlBackgroundColor))
+            .cornerRadius(8)
+
+            if !accessibilityGranted {
+                Text("Note: If you rebuilt the app, you may need to\nremove and re-add it in Accessibility settings.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
+            }
+
+            stepIndicator
+        }
+        .onAppear {
+            startAccessibilityPolling()
+        }
+        .onDisappear {
+            accessibilityTimer?.invalidate()
+        }
+    }
+
+    var testTranscriptionStep: some View {
+        VStack(spacing: 20) {
+            // Microphone picker
+            VStack(spacing: 4) {
+                Picker("Microphone:", selection: $appState.selectedMicrophoneID) {
+                    Text("System Default").tag("default")
+                    ForEach(appState.availableMicrophones) { device in
+                        Text(device.name).tag(device.uid)
+                    }
+                }
+                .frame(maxWidth: 340)
+
+                Text("You can change this later in the menu bar or settings.")
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+            }
+
+            Spacer()
+
+            Group {
+                switch testPhase {
+                case .idle:
+                    VStack(spacing: 20) {
+                        Image(systemName: "mic.fill")
+                            .font(.system(size: 60))
+                            .foregroundStyle(.blue)
+                            .scaleEffect(testMicPulsing ? 1.15 : 1.0)
+                            .animation(.easeInOut(duration: 1.0).repeatForever(autoreverses: true), value: testMicPulsing)
+
+                        Text("Let's Try It Out!")
+                            .font(.title)
+                            .fontWeight(.bold)
+
+                        Text("Press **Fn key** to start recording")
+                            .font(.headline)
+                            .padding(.horizontal, 16)
+                            .padding(.vertical, 10)
+                            .background(Color.blue.opacity(0.1))
+                            .cornerRadius(10)
+
+                        Text("Say anything — a sentence or two is perfect.")
+                            .foregroundStyle(.secondary)
+                            .multilineTextAlignment(.center)
+                    }
+
+                case .recording:
+                    VStack(spacing: 20) {
+                        ZStack {
+                            Circle()
+                                .fill(Color.blue.opacity(0.65))
+                                .frame(width: 100, height: 100)
+
+                            Circle()
+                                .stroke(Color.blue.opacity(0.8), lineWidth: 3)
+                                .frame(width: 100, height: 100)
+                                .shadow(color: .blue.opacity(0.5), radius: 10)
+
+                            WaveformView(audioLevel: testAudioLevel)
+                        }
+
+                        Text("Listening...")
+                            .font(.title2)
+                            .fontWeight(.semibold)
+                            .foregroundStyle(.blue)
+                    }
+
+                case .transcribing:
+                    VStack(spacing: 20) {
+                        InlineTranscribingDots()
+
+                        Text("Transcribing...")
+                            .font(.title2)
+                            .fontWeight(.semibold)
+                            .foregroundStyle(.secondary)
+                    }
+
+                case .done:
+                    VStack(spacing: 16) {
+                        Image(systemName: "checkmark.circle.fill")
+                            .font(.system(size: 60))
+                            .foregroundStyle(.green)
+
+                        if let error = testError {
+                            Text("Something went wrong")
+                                .font(.title2)
+                                .fontWeight(.semibold)
+
+                            Text(error)
+                                .font(.callout)
+                                .foregroundStyle(.secondary)
+                                .multilineTextAlignment(.center)
+
+                            Text("Press **Fn key** to try again")
+                                .font(.callout)
+                                .foregroundStyle(.secondary)
+                        } else if testTranscript.isEmpty {
+                            Text("No speech detected")
+                                .font(.title2)
+                                .fontWeight(.semibold)
+                                .foregroundStyle(.secondary)
+
+                            Text("Press **Fn key** to try again")
+                                .font(.callout)
+                                .foregroundStyle(.secondary)
+                        } else {
+                            Text("Perfect — SimpleVoiceInput is ready to go.")
+                                .font(.title2)
+                                .fontWeight(.semibold)
+
+                            Text(testTranscript)
+                                .font(.body)
+                                .padding(12)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .background(Color(nsColor: .controlBackgroundColor))
+                                .cornerRadius(10)
+                                .transition(.move(edge: .bottom).combined(with: .opacity))
+
+                            Text("Press **Fn key** to try again")
+                                .font(.callout)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                }
+            }
+            .transition(.opacity)
+            .id(testPhase)
+
+            Spacer()
+            stepIndicator
+        }
+        .onAppear {
+            appState.refreshAvailableMicrophones()
+            testMicPulsing = true
+            startTestHotkeyMonitoring()
+        }
+        .onDisappear {
+            stopTestHotkeyMonitoring()
+        }
+    }
+
+    var readyStep: some View {
+        VStack(spacing: 20) {
+            Image(systemName: "checkmark.circle.fill")
+                .font(.system(size: 60))
+                .foregroundStyle(.green)
+
+            Text("You're All Set!")
+                .font(.title)
+                .fontWeight(.bold)
+
+            Text("SimpleVoiceInput lives in your menu bar.")
+                .multilineTextAlignment(.center)
+                .foregroundStyle(.secondary)
+
+            VStack(alignment: .leading, spacing: 12) {
+                HowToRow(icon: "keyboard", text: "Press Fn key to start/stop recording")
+                HowToRow(icon: "hand.raised", text: "Text is automatically typed at your cursor")
+                HowToRow(icon: "doc.on.clipboard", text: "Text is also copied to clipboard")
+            }
+            .padding(.top, 10)
+
+            stepIndicator
+        }
+    }
+
+    var stepIndicator: some View {
+        HStack(spacing: 8) {
+            ForEach(totalSteps, id: \.rawValue) { step in
+                Circle()
+                    .fill(step == currentStep ? Color.blue : Color.gray.opacity(0.3))
+                    .frame(width: 8, height: 8)
+            }
+        }
+        .padding(.top, 20)
+    }
+
+    private var canContinueFromCurrentStep: Bool {
+        switch currentStep {
+        case .micPermission:
+            return micPermissionGranted
+        case .accessibility:
+            return accessibilityGranted
+        case .testTranscription:
+            return testPhase == .done && !testTranscript.isEmpty && testError == nil
+        default:
+            return true
+        }
+    }
+
+    // MARK: - Helpers
+
+    private func instructionRow(number: String, text: LocalizedStringKey) -> some View {
+        HStack(alignment: .top, spacing: 6) {
+            Text(number + ".")
+                .font(.subheadline.monospacedDigit())
+                .foregroundStyle(.secondary)
+                .frame(width: 16, alignment: .trailing)
+            Text(text)
+                .font(.subheadline)
+                .tint(.blue)
+        }
+    }
+
+    // MARK: - Actions
+
+    func validateAndContinue() {
+        let key = apiKeyInput.trimmingCharacters(in: .whitespacesAndNewlines)
+        isValidatingKey = true
+        keyValidationError = nil
+
+        Task {
+            let valid = await GeminiService.validateAPIKey(key)
+            await MainActor.run {
+                isValidatingKey = false
+                if valid {
+                    appState.apiKey = key
+                    withAnimation {
+                        currentStep = nextStep(currentStep)
+                    }
+                } else {
+                    keyValidationError = "Invalid API key. Please check and try again."
+                }
+            }
+        }
+    }
+
+    private func previousStep(_ step: SetupStep) -> SetupStep {
+        let previous = SetupStep(rawValue: step.rawValue - 1)
+        return previous ?? .welcome
+    }
+
+    private func nextStep(_ step: SetupStep) -> SetupStep {
+        let next = SetupStep(rawValue: step.rawValue + 1)
+        return next ?? .ready
+    }
+
+    func checkMicPermission() {
+        switch AVCaptureDevice.authorizationStatus(for: .audio) {
+        case .authorized:
+            micPermissionGranted = true
+        default:
+            break
+        }
+    }
+
+    func startMicPermissionPolling() {
+        micPermissionTimer?.invalidate()
+        micPermissionTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { _ in
+            DispatchQueue.main.async {
+                checkMicPermission()
+            }
+        }
+    }
+
+    func requestMicPermission() {
+        AVCaptureDevice.requestAccess(for: .audio) { granted in
+            DispatchQueue.main.async {
+                micPermissionGranted = granted
+            }
+        }
+    }
+
+    func checkAccessibility() {
+        accessibilityGranted = AXIsProcessTrusted()
+    }
+
+    func startAccessibilityPolling() {
+        accessibilityTimer?.invalidate()
+        accessibilityTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { _ in
+            DispatchQueue.main.async {
+                checkAccessibility()
+            }
+        }
+    }
+
+    func requestAccessibility() {
+        let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue(): true] as CFDictionary
+        AXIsProcessTrustedWithOptions(options)
+    }
+
+    // MARK: - Test Transcription
+
+    private func startTestHotkeyMonitoring() {
+        appState.hotkeyManager.onToggle = { [self] in
+            DispatchQueue.main.async {
+                // Toggle mode: if recording, stop; if idle/done, start
+                if testPhase == .recording {
+                    // Stop recording and transcribe
+                    guard let recorder = testAudioRecorder else { return }
+                    let fileURL = recorder.stopRecording()
+                    testAudioLevelCancellable?.cancel()
+                    testAudioLevelCancellable = nil
+                    testAudioLevel = 0.0
+
+                    withAnimation(.spring(response: 0.4, dampingFraction: 0.8)) {
+                        testPhase = .transcribing
+                    }
+
+                    guard let url = fileURL else {
+                        testError = "No audio file was created."
+                        withAnimation(.spring(response: 0.4, dampingFraction: 0.8)) {
+                            testPhase = .done
+                        }
+                        return
+                    }
+
+                    Task {
+                        do {
+                            let service = GeminiService(apiKey: appState.apiKey)
+                            let result = try await service.processAudio(
+                                fileURL: url,
+                                systemPrompt: appState.systemPrompt
+                            )
+                            await MainActor.run {
+                                testTranscript = result.transcript
+                                withAnimation(.spring(response: 0.5, dampingFraction: 0.7)) {
+                                    testPhase = .done
+                                }
+                            }
+                        } catch {
+                            await MainActor.run {
+                                testError = error.localizedDescription
+                                withAnimation(.spring(response: 0.5, dampingFraction: 0.7)) {
+                                    testPhase = .done
+                                }
+                            }
+                        }
+                        // Clean up temp file
+                        recorder.cleanup()
+                    }
+                } else if testPhase == .idle || testPhase == .done {
+                    // Start recording
+                    if testPhase == .done {
+                        resetTest()
+                    }
+                    do {
+                        let recorder = AudioRecorder()
+                        try recorder.startRecording(deviceUID: appState.selectedMicrophoneID)
+                        testAudioRecorder = recorder
+                        testAudioLevelCancellable = recorder.$audioLevel
+                            .receive(on: DispatchQueue.main)
+                            .sink { level in
+                                testAudioLevel = level
+                            }
+                        withAnimation(.spring(response: 0.4, dampingFraction: 0.8)) {
+                            testPhase = .recording
+                        }
+                    } catch {
+                        testError = error.localizedDescription
+                        withAnimation(.spring(response: 0.4, dampingFraction: 0.8)) {
+                            testPhase = .done
+                        }
+                    }
+                }
+            }
+        }
+
+        appState.hotkeyManager.start()
+    }
+
+    private func stopTestHotkeyMonitoring() {
+        appState.hotkeyManager.stop()
+        appState.hotkeyManager.onToggle = nil
+        testAudioLevelCancellable?.cancel()
+        testAudioLevelCancellable = nil
+        if let recorder = testAudioRecorder, recorder.isRecording {
+            _ = recorder.stopRecording()
+            recorder.cleanup()
+        }
+        testAudioRecorder = nil
+    }
+
+    private func resetTest() {
+        testPhase = .idle
+        testTranscript = ""
+        testError = nil
+        testAudioLevel = 0.0
+        testMicPulsing = true
+        if let recorder = testAudioRecorder {
+            if recorder.isRecording {
+                _ = recorder.stopRecording()
+            }
+            recorder.cleanup()
+            testAudioRecorder = nil
+        }
+    }
+
+}
+
+struct GitHubRepoInfo: Decodable {
+    let stargazersCount: Int
+
+    private enum CodingKeys: String, CodingKey {
+        case stargazersCount = "stargazers_count"
+    }
+}
+
+struct GitHubStarRecord: Decodable, Identifiable {
+    let user: GitHubStarUser
+
+    var id: Int {
+        user.id
+    }
+}
+
+struct GitHubStarUser: Decodable {
+    let id: Int
+    let login: String
+    let avatarUrl: URL
+    let htmlUrl: URL
+
+    /// Avatar URL resized to 44px (2x for 22pt display) for efficient loading
+    var avatarThumbnailUrl: URL {
+        // GitHub avatar URLs already have query params, so append with &
+        let separator = avatarUrl.absoluteString.contains("?") ? "&" : "?"
+        return URL(string: avatarUrl.absoluteString + "\(separator)s=44") ?? avatarUrl
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case id
+        case login
+        case avatarUrl = "avatar_url"
+        case htmlUrl = "html_url"
+    }
+}
+
+@MainActor
+class GitHubMetadataCache: ObservableObject {
+    static let shared = GitHubMetadataCache()
+
+    @Published var starCount: Int?
+    @Published var recentStargazers: [GitHubStarRecord] = []
+    @Published var isLoading = true
+
+    private var lastFetchDate: Date?
+    private let cacheDuration: TimeInterval = 5 * 60 // 5 minutes
+    private let repoAPIURL = URL(string: "https://api.github.com/repos/zachlatta/freeflow")!
+
+    private init() {}
+
+    func fetchIfNeeded() async {
+        if let lastFetch = lastFetchDate, Date().timeIntervalSince(lastFetch) < cacheDuration {
+            return
+        }
+
+        isLoading = true
+
+        do {
+            let repoResult = try await URLSession.shared.data(from: repoAPIURL)
+            guard let repoHTTP = repoResult.1 as? HTTPURLResponse,
+                  (200..<300).contains(repoHTTP.statusCode) else {
+                throw URLError(.badServerResponse)
+            }
+            let count = try JSONDecoder().decode(GitHubRepoInfo.self, from: repoResult.0).stargazersCount
+
+            var recent: [GitHubStarRecord] = []
+            if count > 0 {
+                let perPage = 100
+                let lastPage = max(1, Int(ceil(Double(count) / Double(perPage))))
+                let stargazersURL = URL(string: "https://api.github.com/repos/zachlatta/freeflow/stargazers?per_page=\(perPage)&page=\(lastPage)")!
+                var request = URLRequest(url: stargazersURL)
+                request.setValue("application/vnd.github.v3.star+json", forHTTPHeaderField: "Accept")
+                let starredResult = try await URLSession.shared.data(for: request)
+                if let starredHTTP = starredResult.1 as? HTTPURLResponse,
+                   (200..<300).contains(starredHTTP.statusCode) {
+                    let all = try JSONDecoder().decode([GitHubStarRecord].self, from: starredResult.0)
+                    recent = Array(all.suffix(15).reversed())
+                }
+            }
+
+            starCount = count
+            recentStargazers = recent
+            isLoading = false
+            lastFetchDate = Date()
+        } catch {
+            isLoading = false
+        }
+    }
+}
+
+private struct InlineTranscribingDots: View {
+    @State private var activeDot = 0
+    let timer = Timer.publish(every: 0.4, on: .main, in: .common).autoconnect()
+
+    var body: some View {
+        HStack(spacing: 8) {
+            ForEach(0..<3, id: \.self) { index in
+                Circle()
+                    .fill(Color.blue.opacity(activeDot == index ? 1.0 : 0.3))
+                    .frame(width: 12, height: 12)
+                    .scaleEffect(activeDot == index ? 1.3 : 1.0)
+                    .animation(.easeInOut(duration: 0.3), value: activeDot)
+            }
+        }
+        .onReceive(timer) { _ in
+            activeDot = (activeDot + 1) % 3
+        }
+    }
+}
+
+struct HowToRow: View {
+    let icon: String
+    let text: String
+
+    var body: some View {
+        HStack(spacing: 12) {
+            Image(systemName: icon)
+                .frame(width: 24)
+                .foregroundStyle(.blue)
+            Text(text)
+                .foregroundStyle(.secondary)
+        }
+    }
+}
