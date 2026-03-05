@@ -49,7 +49,7 @@ endif
 	@plutil -replace CFBundleExecutable -string "$(APP_NAME)" "$(CONTENTS)/Info.plist"
 	@plutil -replace CFBundleIdentifier -string "$(BUNDLE_ID)" "$(CONTENTS)/Info.plist"
 	@cp $(ICON_ICNS) "$(RESOURCES)/"
-	@cp gemini3_prompt.md "$(RESOURCES)/"
+	@cp Resources/gemini3_prompt.md "$(RESOURCES)/"
 	@codesign --force --options runtime --sign - --entitlements SimpleVoiceInput.entitlements "$(APP_BUNDLE)"
 	@echo "Built $(APP_BUNDLE)"
 
